@@ -176,6 +176,7 @@ type AgentStore interface {
 	Update(ctx context.Context, id uuid.UUID, updates map[string]any) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, ownerID string) ([]AgentData, error)
+	GetDefault(ctx context.Context) (*AgentData, error) // agent with is_default=true, or first available
 
 	// Access control
 	ShareAgent(ctx context.Context, agentID uuid.UUID, userID, role, grantedBy string) error
@@ -196,7 +197,7 @@ type AgentStore interface {
 	SetUserOverride(ctx context.Context, override *UserAgentOverrideData) error
 
 	// User-agent profiles
-	GetOrCreateUserProfile(ctx context.Context, agentID uuid.UUID, userID, workspace string) (isNew bool, err error)
+	GetOrCreateUserProfile(ctx context.Context, agentID uuid.UUID, userID, workspace, channel string) (isNew bool, effectiveWorkspace string, err error)
 
 	// Group file writers (allowlist for protected file edits in group chats)
 	IsGroupFileWriter(ctx context.Context, agentID uuid.UUID, groupID, userID string) (bool, error)

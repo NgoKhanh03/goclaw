@@ -16,7 +16,7 @@ import (
 // buildMessages constructs the full message list for an LLM request.
 // Returns the messages and whether BOOTSTRAP.md was present in context files
 // (used by the caller for auto-cleanup without an extra DB roundtrip).
-func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, userID string, historyLimit int) ([]providers.Message, bool) {
+func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, userID string, historyLimit int, skillFilter []string) ([]providers.Message, bool) {
 	var messages []providers.Message
 
 	// Build full system prompt using the new builder (matching TS buildAgentSystemPrompt)
@@ -28,10 +28,15 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 	_, hasSpawn := l.tools.Get("spawn")
 	_, hasSkillSearch := l.tools.Get("skill_search")
 
-	// Per-user workspace: show the user's subdirectory in the system prompt (managed mode)
+	// Per-user workspace: show the user's subdirectory in the system prompt (managed mode).
+	// Uses cached workspace from user_agent_profiles (includes channel isolation).
 	promptWorkspace := l.workspace
 	if l.agentUUID != uuid.Nil && userID != "" && l.workspace != "" {
-		promptWorkspace = filepath.Join(l.workspace, sanitizePathSegment(userID))
+		if cachedWs, ok := l.userWorkspaces.Load(userID); ok {
+			promptWorkspace = filepath.Join(cachedWs.(string), sanitizePathSegment(userID))
+		} else {
+			promptWorkspace = filepath.Join(l.workspace, sanitizePathSegment(userID))
+		}
 	}
 
 	// Resolve context files once — also detect BOOTSTRAP.md presence.
@@ -52,7 +57,7 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		OwnerIDs:       l.ownerIDs,
 		Mode:           mode,
 		ToolNames:      l.tools.List(),
-		SkillsSummary:  l.resolveSkillsSummary(),
+		SkillsSummary:  l.resolveSkillsSummary(skillFilter),
 		HasMemory:      l.hasMemory,
 		HasSpawn:       l.tools != nil && hasSpawn,
 		HasSkillSearch: hasSkillSearch,
@@ -137,12 +142,18 @@ const (
 // Returns (summary XML, useInline) — useInline=true means skills are inlined and
 // the system prompt should use TS-style "scan <available_skills>" instructions
 // instead of "use skill_search".
-func (l *Loop) resolveSkillsSummary() string {
+func (l *Loop) resolveSkillsSummary(skillFilter []string) string {
 	if l.skillsLoader == nil {
 		return ""
 	}
 
-	filtered := l.skillsLoader.FilterSkills(l.skillAllowList)
+	// Per-request skill filter overrides agent-level allowList.
+	allowList := l.skillAllowList
+	if skillFilter != nil {
+		allowList = skillFilter
+	}
+
+	filtered := l.skillsLoader.FilterSkills(allowList)
 	if len(filtered) == 0 {
 		return ""
 	}
@@ -156,7 +167,7 @@ func (l *Loop) resolveSkillsSummary() string {
 
 	if len(filtered) <= skillInlineMaxCount && estimatedTokens <= skillInlineMaxTokens {
 		// Inline mode: build full XML summary
-		return l.skillsLoader.BuildSummary(l.skillAllowList)
+		return l.skillsLoader.BuildSummary(allowList)
 	}
 
 	// Search mode: no XML in prompt, agent uses skill_search tool
