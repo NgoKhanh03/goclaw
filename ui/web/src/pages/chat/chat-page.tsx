@@ -18,6 +18,7 @@ export function ChatPage() {
 
   const [agentId, setAgentId] = useState("default");
   const [sessionKey, setSessionKey] = useState(urlSessionKey ?? "");
+  const [scrollTrigger, setScrollTrigger] = useState(0);
 
   const {
     sessions,
@@ -100,6 +101,8 @@ export function ChatPage() {
         setSessionKey(key);
         navigate(`/chat/${encodeURIComponent(key)}`);
       }
+      // Trigger force scroll khi user gửi tin mới
+      setScrollTrigger((n) => n + 1);
       // Pass key directly so send() doesn't use a stale closure value
       send(message, key);
     },
@@ -138,6 +141,7 @@ export function ChatPage() {
           toolStream={toolStream}
           isRunning={isRunning}
           loading={messagesLoading}
+          scrollTrigger={scrollTrigger}
         />
 
         {isOwn ? (

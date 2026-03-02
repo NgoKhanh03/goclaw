@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -36,8 +37,13 @@ func NewOpenAIProvider(name, apiKey, apiBase, defaultModel string) *OpenAIProvid
 		apiBase:      apiBase,
 		chatPath:     "/chat/completions",
 		defaultModel: defaultModel,
-		client:       &http.Client{Timeout: 120 * time.Second},
-		retryConfig:  DefaultRetryConfig(),
+		// Timeout: 0 means no client-level deadline.
+		// Each request must carry its own context with appropriate deadline
+		// (e.g. summoner uses 300s, chat sessions use the session context).
+		// This avoids "Client.Timeout exceeded" on slow AI proxies that take
+		// longer than 120s to return the first header/token.
+		client:      &http.Client{Timeout: 0},
+		retryConfig: DefaultRetryConfig(),
 	}
 }
 
@@ -71,17 +77,21 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	body := p.buildRequestBody(model, req, false)
 
 	return RetryDo(ctx, p.retryConfig, func() (*ChatResponse, error) {
-		respBody, err := p.doRequest(ctx, body)
+		slog.Info("provider: sending HTTP request", "provider", p.name, "model", model, "url", p.apiBase+p.chatPath)
+		t0 := time.Now()
+		respBodyRC, contentType, err := p.doRequestWithHeaders(ctx, body)
 		if err != nil {
+			slog.Warn("provider: HTTP request failed", "provider", p.name, "elapsed", time.Since(t0).Round(time.Millisecond), "error", err)
 			return nil, err
 		}
-		defer respBody.Close()
+		defer respBodyRC.Close()
+		slog.Info("provider: HTTP 200 received", "provider", p.name, "content_type", contentType, "elapsed", time.Since(t0).Round(time.Millisecond))
 
 		var oaiResp openAIResponse
-		if err := json.NewDecoder(respBody).Decode(&oaiResp); err != nil {
+		if err := json.NewDecoder(respBodyRC).Decode(&oaiResp); err != nil {
 			return nil, fmt.Errorf("%s: decode response: %w", p.name, err)
 		}
-
+		slog.Info("provider: JSON response decoded", "provider", p.name, "elapsed", time.Since(t0).Round(time.Millisecond))
 		return p.parseResponse(&oaiResp), nil
 	})
 }
@@ -90,35 +100,158 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	model := p.resolveModel(req.Model)
 	body := p.buildRequestBody(model, req, true)
 
-	// Retry only the connection phase; once streaming starts, no retry.
-	respBody, err := RetryDo(ctx, p.retryConfig, func() (io.ReadCloser, error) {
-		return p.doRequest(ctx, body)
+	type streamOpened struct {
+		rc          io.ReadCloser
+		contentType string
+	}
+
+	opened, err := RetryDo(ctx, p.retryConfig, func() (streamOpened, error) {
+		slog.Info("provider: sending HTTP stream request", "provider", p.name, "model", model, "url", p.apiBase+p.chatPath)
+		t0 := time.Now()
+		rc, ct, err := p.doRequestWithHeaders(ctx, body)
+		if err != nil {
+			slog.Warn("provider: HTTP stream request failed", "provider", p.name, "elapsed", time.Since(t0).Round(time.Millisecond), "error", err)
+			return streamOpened{}, err
+		}
+		slog.Info("provider: HTTP 200 stream established", "provider", p.name, "content_type", ct, "elapsed", time.Since(t0).Round(time.Millisecond))
+		return streamOpened{rc: rc, contentType: ct}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	defer respBody.Close()
+	defer opened.rc.Close()
+
+	// ── Fallback: proxy trả về plain JSON thay vì SSE ──────────────────────
+	// Một số AI proxy (vd localhost:3001) bỏ qua "stream":true và trả về
+	// chat.completion JSON thông thường với Content-Type: application/json.
+	// Nhận biết bằng cách kiểm tra content-type không chứa "event-stream".
+	if !strings.Contains(opened.contentType, "event-stream") {
+		slog.Info("stream: non-SSE response detected – parsing as plain JSON",
+			"provider", p.name, "content_type", opened.contentType)
+
+		var oaiResp openAIResponse
+		if err := json.NewDecoder(opened.rc).Decode(&oaiResp); err != nil {
+			return nil, fmt.Errorf("%s: decode non-SSE response: %w", p.name, err)
+		}
+		result := p.parseResponse(&oaiResp)
+
+		slog.Info("stream: fallback JSON parsed",
+			"provider", p.name,
+			"content_len", len(result.Content),
+			"finish_reason", result.FinishReason,
+			"tool_calls", len(result.ToolCalls),
+		)
+
+		// Giả lập streaming chunks để UI nhận được đúng flow
+		if onChunk != nil {
+			if result.Thinking != "" {
+				onChunk(StreamChunk{Thinking: result.Thinking})
+			}
+			// Chia nhỏ content thành chunks để UI stream mượt hơn
+			const chunkSize = 10
+			runes := []rune(result.Content)
+			for i := 0; i < len(runes); i += chunkSize {
+				end := i + chunkSize
+				if end > len(runes) {
+					end = len(runes)
+				}
+				onChunk(StreamChunk{Content: string(runes[i:end])})
+			}
+			onChunk(StreamChunk{Done: true})
+		}
+		return result, nil
+	}
+
+	// ── SSE streaming path ──────────────────────────────────────────────────
+	respBody := opened.rc
 
 	result := &ChatResponse{FinishReason: "stop"}
 	accumulators := make(map[int]*toolCallAccumulator)
 
 	scanner := bufio.NewScanner(respBody)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line
+
+	totalLines := 0
+	dataLines := 0
+	parsedChunks := 0
+	contentChunks := 0
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		totalLines++
+
+		// Log 15 dòng đầu raw để debug format thực tế từ server
+		if totalLines <= 15 {
+			preview := line
+			if len(preview) > 120 {
+				preview = preview[:120] + "..."
+			}
+			slog.Info("stream: raw line", "provider", p.name, "n", totalLines, "line", preview)
+		}
+
+		if !strings.HasPrefix(line, "data:") {
+			if line != "" {
+				slog.Debug("stream: non-data line skipped", "provider", p.name, "line", line)
+			}
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
+
+		dataLines++
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
 		if data == "[DONE]" {
+			slog.Info("stream: [DONE] received",
+				"provider", p.name,
+				"total_lines", totalLines,
+				"data_lines", dataLines,
+				"parsed_chunks", parsedChunks,
+				"content_chunks", contentChunks,
+			)
 			break
 		}
 
 		var chunk openAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			slog.Warn("stream: JSON parse error",
+				"provider", p.name,
+				"err", err,
+				"data", func() string {
+					if len(data) > 300 {
+						return data[:300]
+					}
+					return data
+				}(),
+			)
 			continue
 		}
+		parsedChunks++
 
 		if len(chunk.Choices) == 0 {
+			if chunk.Usage != nil {
+				slog.Info("stream: usage chunk",
+					"provider", p.name,
+					"prompt_tokens", chunk.Usage.PromptTokens,
+					"completion_tokens", chunk.Usage.CompletionTokens,
+				)
+				result.Usage = &Usage{
+					PromptTokens:     chunk.Usage.PromptTokens,
+					CompletionTokens: chunk.Usage.CompletionTokens,
+					TotalTokens:      chunk.Usage.TotalTokens,
+				}
+				if chunk.Usage.PromptTokensDetails != nil {
+					result.Usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				}
+				if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+					result.Usage.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+				}
+			} else {
+				slog.Debug("stream: empty choices (no usage)", "provider", p.name, "data", func() string {
+					if len(data) > 150 {
+						return data[:150]
+					}
+					return data
+				}())
+			}
 			continue
 		}
 
@@ -130,6 +263,15 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 			}
 		}
 		if delta.Content != "" {
+			contentChunks++
+			if contentChunks == 1 {
+				slog.Info("stream: first content chunk received", "provider", p.name, "content_preview", func() string {
+					if len(delta.Content) > 50 {
+						return delta.Content[:50]
+					}
+					return delta.Content
+				}())
+			}
 			result.Content += delta.Content
 			if onChunk != nil {
 				onChunk(StreamChunk{Content: delta.Content})
@@ -156,6 +298,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 
 		if chunk.Choices[0].FinishReason != "" {
 			result.FinishReason = chunk.Choices[0].FinishReason
+			slog.Info("stream: finish_reason set", "provider", p.name, "finish_reason", result.FinishReason)
 		}
 
 		if chunk.Usage != nil {
@@ -171,14 +314,34 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 				result.Usage.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
 			}
 		}
-
 	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Warn("provider: stream scanner error", "provider", p.name, "error", err)
+	}
+
+	slog.Info("stream: done",
+		"provider", p.name,
+		"total_lines", totalLines,
+		"data_lines", dataLines,
+		"parsed_chunks", parsedChunks,
+		"content_chunks", contentChunks,
+		"content_len", len(result.Content),
+		"thinking_len", len(result.Thinking),
+		"tool_calls", len(accumulators),
+		"finish_reason", result.FinishReason,
+	)
 
 	// Parse accumulated tool call arguments
 	for i := 0; i < len(accumulators); i++ {
-		acc := accumulators[i]
+		acc, ok := accumulators[i]
+		if !ok {
+			continue
+		}
 		args := make(map[string]interface{})
-		_ = json.Unmarshal([]byte(acc.rawArgs), &args)
+		if acc.rawArgs != "" {
+			_ = json.Unmarshal([]byte(acc.rawArgs), &args)
+		}
 		acc.Arguments = args
 		if acc.thoughtSig != "" {
 			acc.Metadata = map[string]string{"thought_signature": acc.thoughtSig}
@@ -311,14 +474,19 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 }
 
 func (p *OpenAIProvider) doRequest(ctx context.Context, body interface{}) (io.ReadCloser, error) {
+	rc, _, err := p.doRequestWithHeaders(ctx, body)
+	return rc, err
+}
+
+func (p *OpenAIProvider) doRequestWithHeaders(ctx context.Context, body interface{}) (io.ReadCloser, string, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("%s: marshal request: %w", p.name, err)
+		return nil, "", fmt.Errorf("%s: marshal request: %w", p.name, err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+p.chatPath, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("%s: create request: %w", p.name, err)
+		return nil, "", fmt.Errorf("%s: create request: %w", p.name, err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -326,21 +494,21 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body interface{}) (io.Re
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%s: request failed: %w", p.name, err)
+		return nil, "", fmt.Errorf("%s: request failed: %w", p.name, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"))
-		return nil, &HTTPError{
+		return nil, "", &HTTPError{
 			Status:     resp.StatusCode,
 			Body:       fmt.Sprintf("%s: %s", p.name, string(respBody)),
 			RetryAfter: retryAfter,
 		}
 	}
 
-	return resp.Body, nil
+	return resp.Body, resp.Header.Get("Content-Type"), nil
 }
 
 func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
@@ -387,4 +555,3 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 
 	return result
 }
-

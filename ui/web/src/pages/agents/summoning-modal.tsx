@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Dialog,
@@ -23,6 +23,9 @@ const SUMMONING_FILES = [
   { name: "IDENTITY.md", label: "Identity Card" },
 ];
 
+// Show "Skip" button after this many seconds of waiting
+const SKIP_SHOW_AFTER_MS = 15_000;
+
 export function SummoningModal({
   open,
   onOpenChange,
@@ -35,14 +38,35 @@ export function SummoningModal({
   const [status, setStatus] = useState<"summoning" | "completed" | "failed">("summoning");
   const [errorMsg, setErrorMsg] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [showSkip, setShowSkip] = useState(false);
+  const [skipping, setSkipping] = useState(false);
+  const skipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Reset state when modal opens
+  // Reset state when modal opens/closes
   useEffect(() => {
     if (open) {
       setGeneratedFiles([]);
       setStatus("summoning");
       setErrorMsg("");
+      setShowSkip(false);
+      setSkipping(false);
+
+      // Show skip button after SKIP_SHOW_AFTER_MS
+      skipTimerRef.current = setTimeout(() => {
+        setShowSkip(true);
+      }, SKIP_SHOW_AFTER_MS);
+    } else {
+      if (skipTimerRef.current) {
+        clearTimeout(skipTimerRef.current);
+        skipTimerRef.current = null;
+      }
     }
+    return () => {
+      if (skipTimerRef.current) {
+        clearTimeout(skipTimerRef.current);
+        skipTimerRef.current = null;
+      }
+    };
   }, [open]);
 
 
@@ -80,6 +104,10 @@ export function SummoningModal({
       setGeneratedFiles([]);
       setStatus("summoning");
       setErrorMsg("");
+      setShowSkip(false);
+      // Restart skip timer
+      if (skipTimerRef.current) clearTimeout(skipTimerRef.current);
+      skipTimerRef.current = setTimeout(() => setShowSkip(true), SKIP_SHOW_AFTER_MS);
     } catch {
       // stay in failed state
     } finally {
@@ -87,9 +115,34 @@ export function SummoningModal({
     }
   };
 
+  // Stop current summoning and re-summon from scratch
+  const handleStopAndResummon = async () => {
+    setSkipping(true);
+    try {
+      await http.post(`/v1/agents/${agentId}/resummon`);
+      setGeneratedFiles([]);
+      setStatus("summoning");
+      setErrorMsg("");
+      setShowSkip(false);
+      // Restart skip timer
+      if (skipTimerRef.current) clearTimeout(skipTimerRef.current);
+      skipTimerRef.current = setTimeout(() => setShowSkip(true), SKIP_SHOW_AFTER_MS);
+    } catch {
+      // stay in current state
+    } finally {
+      setSkipping(false);
+    }
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" overlayTransparent onInteractOutside={(e) => { if (status === "summoning") e.preventDefault(); }}>
+      <DialogContent
+        className="sm:max-w-md"
+        overlayTransparent
+        onInteractOutside={(e) => {
+          if (status === "summoning") e.preventDefault();
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="text-center">
             {status === "completed"
@@ -118,13 +171,12 @@ export function SummoningModal({
               </>
             )}
             <motion.div
-              className={`relative z-10 flex h-16 w-16 items-center justify-center rounded-full text-3xl ${
-                status === "completed"
-                  ? "bg-emerald-100 dark:bg-emerald-900/30"
-                  : status === "failed"
-                    ? "bg-red-100 dark:bg-red-900/30"
-                    : "bg-violet-100 dark:bg-violet-900/30"
-              }`}
+              className={`relative z-10 flex h-16 w-16 items-center justify-center rounded-full text-3xl ${status === "completed"
+                ? "bg-emerald-100 dark:bg-emerald-900/30"
+                : status === "failed"
+                  ? "bg-red-100 dark:bg-red-900/30"
+                  : "bg-violet-100 dark:bg-violet-900/30"
+                }`}
               animate={
                 status === "summoning"
                   ? { rotate: [0, 5, -5, 0] }
@@ -138,11 +190,11 @@ export function SummoningModal({
                   : { duration: 0.5 }
               }
             >
-              {status === "completed" ? "\u2728" : status === "failed" ? "\u{1F4A8}" : "\u{1FA84}"}
+              {status === "completed" ? "✨" : status === "failed" ? "💨" : "🪄"}
             </motion.div>
           </div>
 
-          {/* Agent name */}
+          {/* Status text */}
           <p className="text-sm text-foreground">
             {status === "completed" ? (
               <span className="font-medium text-emerald-600 dark:text-emerald-400">
@@ -157,7 +209,7 @@ export function SummoningModal({
             )}
           </p>
 
-          {/* File progress */}
+          {/* File progress list */}
           <div className="w-full space-y-2">
             <AnimatePresence>
               {SUMMONING_FILES.map((file, i) => {
@@ -171,15 +223,14 @@ export function SummoningModal({
                     className="flex items-center gap-3 rounded-md px-3 py-1.5"
                   >
                     <motion.div
-                      className={`flex h-5 w-5 items-center justify-center rounded-full text-xs ${
-                        done
-                          ? "bg-violet-100 text-violet-600 dark:bg-violet-900/40 dark:text-violet-400"
-                          : "bg-muted text-muted-foreground"
-                      }`}
+                      className={`flex h-5 w-5 items-center justify-center rounded-full text-xs ${done
+                        ? "bg-violet-100 text-violet-600 dark:bg-violet-900/40 dark:text-violet-400"
+                        : "bg-muted text-muted-foreground"
+                        }`}
                       animate={done ? { scale: [0.8, 1.2, 1] } : {}}
                       transition={{ duration: 0.3 }}
                     >
-                      {done ? "\u2713" : i + 1}
+                      {done ? "✓" : i + 1}
                     </motion.div>
                     <div className="flex-1">
                       <span className={`text-sm text-foreground ${done ? "font-medium" : ""}`}>
@@ -202,16 +253,44 @@ export function SummoningModal({
             </AnimatePresence>
           </div>
 
+          {/* Summoning state: hint + skip button */}
           {status === "summoning" && (
-            <p className="text-center text-xs text-muted-foreground">
-              This usually takes few minutes. Please wait...
-            </p>
+            <div className="flex flex-col items-center gap-3 w-full">
+              <p className="text-center text-xs text-muted-foreground">
+                This usually takes a few minutes. Please wait...
+              </p>
+
+              {/* Stop & Re-summon button — appears after SKIP_SHOW_AFTER_MS to avoid accidental clicks */}
+              <AnimatePresence>
+                {showSkip && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 6 }}
+                    transition={{ duration: 0.3 }}
+                  >
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleStopAndResummon}
+                      disabled={skipping}
+                      className="text-xs text-muted-foreground hover:text-foreground"
+                    >
+                      {skipping ? "Stopping..." : "Stop & Re-summon"}
+                    </Button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
           )}
 
+          {/* Failed state: retry only */}
           {status === "failed" && (
-            <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying}>
-              {retrying ? "Retrying..." : "Retry"}
-            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying || skipping}>
+                {retrying ? "Retrying..." : "Retry"}
+              </Button>
+            </div>
           )}
         </div>
       </DialogContent>

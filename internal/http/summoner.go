@@ -70,17 +70,24 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, providerName, model, desc
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
+	slog.Info("summoning: started", "agent", agentID, "provider", providerName, "model", model)
 	s.emitEvent(agentID, SummonEventStarted, "", "")
 
-	files, err := s.generateFiles(ctx, providerName, model, s.buildCreatePrompt(description))
+	prompt := s.buildCreatePrompt(description)
+	slog.Info("summoning: prompt built", "agent", agentID, "prompt_len", len(prompt))
+
+	slog.Info("summoning: calling LLM...", "agent", agentID, "provider", providerName, "model", model)
+	start := time.Now()
+	files, err := s.generateFiles(ctx, providerName, model, prompt)
 	if err != nil {
 		slog.Warn("summoning: LLM generation failed, falling back to templates",
-			"agent", agentID, "error", err)
+			"agent", agentID, "elapsed", time.Since(start).Round(time.Millisecond), "error", err)
 		s.emitEvent(agentID, SummonEventFailed, "", err.Error())
 		// Use fresh context — the original may have timed out, but we still need to update status.
 		s.setAgentStatus(context.Background(), agentID, store.AgentStatusSummonFailed)
 		return
 	}
+	slog.Info("summoning: LLM returned files", "agent", agentID, "elapsed", time.Since(start).Round(time.Millisecond), "files", len(files))
 
 	s.storeFiles(ctx, agentID, files)
 
@@ -165,7 +172,9 @@ func (s *AgentSummoner) generateFiles(ctx context.Context, providerName, model, 
 	if err != nil {
 		return nil, fmt.Errorf("resolve provider: %w", err)
 	}
+	slog.Info("summoning: provider resolved", "provider", provider.Name())
 
+	slog.Info("summoning: sending request to LLM", "provider", provider.Name(), "model", model, "prompt_chars", len(prompt))
 	resp, err := provider.Chat(ctx, providers.ChatRequest{
 		Messages: []providers.Message{
 			{Role: "user", Content: prompt},
@@ -179,11 +188,25 @@ func (s *AgentSummoner) generateFiles(ctx context.Context, providerName, model, 
 	if err != nil {
 		return nil, fmt.Errorf("LLM call: %w", err)
 	}
+	slog.Info("summoning: LLM response received",
+		"provider", provider.Name(),
+		"response_chars", len(resp.Content),
+		"finish_reason", resp.FinishReason,
+	)
 
 	files := parseFileResponse(resp.Content)
 	if len(files) == 0 {
+		slog.Warn("summoning: no parseable files in response",
+			"response_preview", func() string {
+				if len(resp.Content) > 500 {
+					return resp.Content[:500] + "..."
+				}
+				return resp.Content
+			}(),
+		)
 		return nil, fmt.Errorf("LLM returned no parseable files (response length: %d)", len(resp.Content))
 	}
+	slog.Info("summoning: files parsed from response", "file_count", len(files))
 
 	return files, nil
 }

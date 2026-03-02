@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { StreamingText } from "@/components/chat/streaming-text";
 import { ToolCallCard } from "@/components/chat/tool-call-card";
@@ -13,6 +14,7 @@ interface ChatThreadProps {
   toolStream: ToolStreamEntry[];
   isRunning: boolean;
   loading?: boolean;
+  scrollTrigger?: number;
 }
 
 export function ChatThread({
@@ -22,10 +24,19 @@ export function ChatThread({
   toolStream,
   isRunning,
   loading,
+  scrollTrigger,
 }: ChatThreadProps) {
-  const { ref, onScroll } = useAutoScroll<HTMLDivElement>(
+  const { ref, onScroll, forceScrollToBottom } = useAutoScroll<HTMLDivElement>(
     [messages.length, streamText, thinkingText, toolStream.length],
   );
+
+  // Khi scrollTrigger thay đổi (user vừa gửi tin), force scroll xuống cuối
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (scrollTrigger) {
+      forceScrollToBottom();
+    }
+  }, [scrollTrigger]);
 
   // Show spinner while loading history for a different session
   if (loading) {

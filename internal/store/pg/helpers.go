@@ -57,11 +57,11 @@ func derefUUID(u *uuid.UUID) uuid.UUID {
 
 // --- JSON helpers ---
 
-func jsonOrEmpty(data []byte) []byte {
+func jsonOrEmpty(data json.RawMessage) []byte {
 	if data == nil {
 		return []byte("{}")
 	}
-	return data
+	return []byte(data)
 }
 
 func jsonOrNull(data json.RawMessage) interface{} {

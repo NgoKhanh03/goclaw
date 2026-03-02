@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"os"
 
 	"github.com/google/uuid"
 
@@ -324,21 +325,28 @@ func wireManagedExtras(
 		// Register delegate_search tool (hybrid FTS + semantic agent discovery)
 		var delegateEmbProvider store.EmbeddingProvider
 		if agentStore, ok := stores.Agents.(*pg.PGAgentStore); ok {
-			memCfg := appCfg.Agents.Defaults.Memory
-			if embProvider := resolveEmbeddingProvider(appCfg, memCfg); embProvider != nil {
-				agentStore.SetEmbeddingProvider(embProvider)
-				delegateEmbProvider = embProvider
-				slog.Info("managed mode: agent embeddings enabled")
+			// Allow disabling agent embeddings via env var (e.g. when using a local proxy
+			// without real OpenAI embedding API access).
+			agentEmbeddingsEnabled := os.Getenv("GOCLAW_AGENT_EMBEDDINGS") != "false"
+			if agentEmbeddingsEnabled {
+				memCfg := appCfg.Agents.Defaults.Memory
+				if embProvider := resolveEmbeddingProvider(appCfg, memCfg); embProvider != nil {
+					agentStore.SetEmbeddingProvider(embProvider)
+					delegateEmbProvider = embProvider
+					slog.Info("managed mode: agent embeddings enabled")
 
-				// Backfill embeddings for existing agents with frontmatter
-				go func() {
-					count, err := agentStore.BackfillAgentEmbeddings(context.Background())
-					if err != nil {
-						slog.Warn("agent embeddings backfill failed", "error", err)
-					} else if count > 0 {
-						slog.Info("agent embeddings backfill complete", "updated", count)
-					}
-				}()
+					// Backfill embeddings for existing agents with frontmatter
+					go func() {
+						count, err := agentStore.BackfillAgentEmbeddings(context.Background())
+						if err != nil {
+							slog.Warn("agent embeddings backfill failed", "error", err)
+						} else if count > 0 {
+							slog.Info("agent embeddings backfill complete", "updated", count)
+						}
+					}()
+				}
+			} else {
+				slog.Info("managed mode: agent embeddings disabled (GOCLAW_AGENT_EMBEDDINGS=false)")
 			}
 		}
 		toolsReg.Register(tools.NewDelegateSearchTool(stores.AgentLinks, delegateEmbProvider))

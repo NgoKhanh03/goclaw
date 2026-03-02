@@ -7,7 +7,7 @@ export class HttpClient {
     private baseUrl: string,
     private getToken: () => string,
     private getUserId: () => string,
-  ) {}
+  ) { }
 
   async get<T>(path: string, params?: Record<string, string>): Promise<T> {
     const url = this.buildUrl(path, params);
@@ -37,7 +37,7 @@ export class HttpClient {
     const token = this.getToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
     const userId = this.getUserId();
-    if (userId) headers["X-GoClaw-User-Id"] = userId;
+    if (userId) headers["X-GoClaw-User-Id"] = encodeURIComponent(userId);
 
     const res = await fetch(this.buildUrl(path), {
       method: "POST",
@@ -73,7 +73,7 @@ export class HttpClient {
     const token = this.getToken();
     if (token) h["Authorization"] = `Bearer ${token}`;
     const userId = this.getUserId();
-    if (userId) h["X-GoClaw-User-Id"] = userId;
+    if (userId) h["X-GoClaw-User-Id"] = encodeURIComponent(userId);
     return h;
   }
 

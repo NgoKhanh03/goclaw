@@ -19,6 +19,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	"github.com/nextlevelbuilder/goclaw/internal/ui"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -183,6 +184,14 @@ func (s *Server) BuildMux() *http.ServeMux {
 	// Managed mode: builtin tool management API
 	if s.builtinToolsHandler != nil {
 		s.builtinToolsHandler.RegisterRoutes(mux)
+	}
+
+	// Mount embedded React UI at root — must be last so API routes take priority.
+	if ui.Available() {
+		mux.Handle("/", ui.Handler())
+		slog.Info("ui: dashboard embedded and serving at /")
+	} else {
+		slog.Info("ui: no embedded dashboard (run 'make build-ui' to include it)")
 	}
 
 	s.mux = mux

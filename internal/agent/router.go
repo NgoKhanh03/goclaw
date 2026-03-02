@@ -97,6 +97,18 @@ func (r *Router) Remove(agentID string) {
 	delete(r.agents, agentID)
 }
 
+// GetIfLoaded returns the agent only if it is already cached in-memory (no lazy-load).
+// Returns nil, false if the agent is not loaded. Used for lightweight isRunning checks.
+func (r *Router) GetIfLoaded(agentID string) (Agent, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.agents[agentID]
+	if !ok {
+		return nil, false
+	}
+	return entry.agent, true
+}
+
 // List returns all registered agent IDs.
 func (r *Router) List() []string {
 	r.mu.RLock()

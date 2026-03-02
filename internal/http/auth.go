@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -37,6 +38,11 @@ func extractUserID(r *http.Request) string {
 	id := r.Header.Get("X-GoClaw-User-Id")
 	if id == "" {
 		return ""
+	}
+	// Decode percent-encoding (e.g. "Kh%C3%A1nh" → "Khánh") so non-ASCII
+	// usernames sent from browsers are stored as valid UTF-8 in Postgres.
+	if decoded, err := url.QueryUnescape(id); err == nil {
+		id = decoded
 	}
 	if err := store.ValidateUserID(id); err != nil {
 		slog.Warn("security.user_id_too_long", "length", len(id), "max", store.MaxUserIDLength)

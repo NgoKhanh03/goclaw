@@ -578,12 +578,19 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error) 
 					})
 				}
 				if chunk.Content != "" {
-					l.emit(AgentEvent{
-						Type:    protocol.ChatEventChunk,
-						AgentID: l.id,
-						RunID:   req.RunID,
-						Payload: map[string]string{"content": chunk.Content},
-					})
+					// Sanitize each stream chunk to strip tool-call XML before
+					// emitting to the client. This prevents raw XML tags like
+					// </function_calls>, <function_response>, etc. from flashing
+					// in the chat UI during streaming.
+					sanitized := SanitizeStreamChunk(chunk.Content)
+					if sanitized != "" {
+						l.emit(AgentEvent{
+							Type:    protocol.ChatEventChunk,
+							AgentID: l.id,
+							RunID:   req.RunID,
+							Payload: map[string]string{"content": sanitized},
+						})
+					}
 				}
 			})
 		} else {

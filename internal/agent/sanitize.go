@@ -73,10 +73,30 @@ func SanitizeAssistantContent(content string) string {
 
 // --- 1. Garbled tool-call XML ---
 
-// garbledToolXMLPattern matches XML-like tool call artifacts that some models
-// (DeepSeek, GLM, etc.) emit as text content instead of proper tool calls.
-var garbledToolXMLPattern = regexp.MustCompile(
-	`(?s)</?(?:function_calls?|functioninvoke|invoke|invfunction_calls|tool_call|tool_use|parameter|minimax:tool_call)[^>]*>`,
+// garbledToolXMLBlockPattern matches entire tool_call/tool_use/function_calls/function_response blocks
+// including their content (proxy may embed tool execution inline in response content).
+// Also catches antml:function_calls / antml:invoke / antml:parameter variants.
+var garbledToolXMLBlockPattern = regexp.MustCompile(
+	`(?si)\s*<(?:antml:)?(?:tool_call|tool_use|function_calls?|function_response|invoke|invfunction_calls|functioninvoke|minimax:tool_call|parameter)[^>]*>.*?</(?:antml:)?(?:tool_call|tool_use|function_calls?|function_response|invoke|invfunction_calls|functioninvoke|minimax:tool_call|parameter)>`,
+)
+
+// toolResponseBlockPattern matches <tool_response>...</tool_response> and
+// <function_response>...</function_response> blocks that proxies embed
+// when they execute tools inline.
+var toolResponseBlockPattern = regexp.MustCompile(
+	`(?si)\s*<(?:antml:)?(?:tool_response|function_response)[^>]*>.*?</(?:antml:)?(?:tool_response|function_response)>`,
+)
+
+// strayClosingTagPattern matches orphan closing tags that appear when
+// a partial tool-call block is streamed across multiple chunks, e.g.
+// "Successfully edited IDENTITY.md </function_response> </function_calls>".
+var strayClosingTagPattern = regexp.MustCompile(
+	`(?i)\s*</(?:antml:)?(?:tool_call|tool_use|function_calls?|function_response|tool_response|invoke|invfunction_calls|functioninvoke|minimax:tool_call|parameter)>`,
+)
+
+// strayOpeningTagPattern matches opening tags without proper close (partial XML).
+var strayOpeningTagPattern = regexp.MustCompile(
+	`(?i)<(?:antml:)?(?:tool_call|tool_use|function_calls?|function_response|tool_response|invoke|invfunction_calls|functioninvoke|minimax:tool_call|parameter)\b[^>]*>`,
 )
 
 var garbledToolXMLIndicators = []string{
@@ -85,9 +105,17 @@ var garbledToolXMLIndicators = []string{
 	"<parameter name=",
 	"</parameter",
 	"<function_call",
+	"<function_response",
+	"</function_response",
+	"</function_calls",
 	"<tool_call",
 	"<tool_use",
+	"<tool_response",
 	"<minimax:tool_call",
+	"<function_calls",
+	"<invoke",
+	"<parameter",
+	"antml:function_calls",
 }
 
 func stripGarbledToolXML(content string) string {
@@ -103,21 +131,26 @@ func stripGarbledToolXML(content string) string {
 		return content
 	}
 
-	cleaned := garbledToolXMLPattern.ReplaceAllString(content, "")
+	// Strip entire blocks (including inner content) so proxy-embedded tool
+	// executions are removed while keeping the surrounding user-facing text.
+	cleaned := garbledToolXMLBlockPattern.ReplaceAllString(content, "")
+	cleaned = toolResponseBlockPattern.ReplaceAllString(cleaned, "")
+	// Also strip any orphaned opening/closing tags left over from partial blocks.
+	cleaned = strayClosingTagPattern.ReplaceAllString(cleaned, "")
+	cleaned = strayOpeningTagPattern.ReplaceAllString(cleaned, "")
 	cleaned = strings.TrimSpace(cleaned)
 
-	if cleaned != "" && hasIndicator {
-		slog.Warn("stripped garbled tool call response",
+	if cleaned != "" {
+		slog.Warn("stripped inline tool call blocks from proxy response",
 			"original_len", len(content),
 			"remaining_len", len(cleaned),
 		)
-		return ""
+		return cleaned
 	}
 
-	if cleaned == "" {
-		slog.Warn("stripped entire response as garbled tool XML", "original_len", len(content))
-	}
-	return cleaned
+	// Nothing left after strip → entire response was tool XML
+	slog.Warn("stripped entire response as garbled tool XML", "original_len", len(content))
+	return ""
 }
 
 // --- 2. Downgraded tool call text ---
@@ -313,6 +346,72 @@ var leadingBlankLinesPattern = regexp.MustCompile(`^(?:[ \t]*\r?\n)+`)
 
 func stripLeadingBlankLines(content string) string {
 	return leadingBlankLinesPattern.ReplaceAllString(content, "")
+}
+
+// --- Stream chunk sanitization ---
+
+// toolCallXMLStreamIndicators are substrings that identify tool-call XML
+// fragments in a streaming chunk. When detected, the chunk content is scrubbed
+// before emitting to the client (prevents raw XML flashing in the UI).
+var toolCallXMLStreamIndicators = []string{
+	"</function_calls",
+	"</function_response",
+	"<function_calls",
+	"<function_response",
+	"</tool_call",
+	"</tool_use",
+	"</tool_response",
+	"<tool_call",
+	"<tool_use",
+	"<tool_response",
+	"<invoke",
+	"<parameter name=",
+	"</parameter>",
+	"invfunction_calls",
+	"functioninvoke",
+	"antml:function_calls",
+	"antml:invoke",
+	"antml:parameter",
+}
+
+// hasToolCallXMLIndicator checks if text contains any tool-call XML indicator.
+func hasToolCallXMLIndicator(text string) bool {
+	lower := strings.ToLower(text)
+	for _, ind := range toolCallXMLStreamIndicators {
+		if strings.Contains(lower, strings.ToLower(ind)) {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizeStreamChunk performs lightweight sanitization on a streaming content
+// chunk. This is called in real-time as chunks arrive (before emitting to UI)
+// to prevent raw tool-call XML from flashing in the chat.
+//
+// This is NOT a replacement for the full SanitizeAssistantContent pipeline —
+// that still runs on the final accumulated content. This function handles the
+// most critical case: tool-call XML appearing in streamed text.
+func SanitizeStreamChunk(chunk string) string {
+	if chunk == "" {
+		return chunk
+	}
+	if !hasToolCallXMLIndicator(chunk) {
+		return chunk
+	}
+
+	cleaned := garbledToolXMLBlockPattern.ReplaceAllString(chunk, "")
+	cleaned = toolResponseBlockPattern.ReplaceAllString(cleaned, "")
+	cleaned = strayClosingTagPattern.ReplaceAllString(cleaned, "")
+	cleaned = strayOpeningTagPattern.ReplaceAllString(cleaned, "")
+
+	if cleaned != chunk {
+		slog.Debug("sanitized stream chunk",
+			"original_len", len(chunk),
+			"cleaned_len", len(cleaned),
+		)
+	}
+	return cleaned
 }
 
 // --- NO_REPLY detection ---

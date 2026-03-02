@@ -92,6 +92,57 @@ func (m *AgentsMethods) handleAgentWait(_ context.Context, client *gateway.Clien
 }
 
 func (m *AgentsMethods) handleList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	// Managed mode: list agents from DB (full, access-filtered list)
+	if m.isManaged && m.agentStore != nil {
+		agents, err := m.agentStore.List(context.Background(), "")
+		if err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, fmt.Sprintf("failed to list agents: %v", err)))
+			return
+		}
+		type agentInfo struct {
+			// id = agent_key (slug) — must match agent.Router key and chat.send agentId param
+			ID        string `json:"id"`
+			UUID      string `json:"uuid"`
+			AgentKey  string `json:"agentKey"`
+			Name      string `json:"name"`
+			Model     string `json:"model"`
+			Provider  string `json:"provider"`
+			Status    string `json:"status"`
+			AgentType string `json:"agentType"`
+			IsDefault bool   `json:"isDefault"`
+			IsRunning bool   `json:"isRunning"`
+		}
+		infos := make([]agentInfo, 0, len(agents))
+		for _, a := range agents {
+			if a.Status != store.AgentStatusActive {
+				continue // skip summoning/failed agents
+			}
+			loop, _ := m.agents.GetIfLoaded(a.AgentKey)
+			isRunning := loop != nil && loop.IsRunning()
+			name := a.DisplayName
+			if name == "" {
+				name = a.AgentKey
+			}
+			infos = append(infos, agentInfo{
+				ID:        a.AgentKey,        // agent_key for router.Get() compat
+				UUID:      a.ID.String(),     // keep UUID for reference
+				AgentKey:  a.AgentKey,
+				Name:      name,
+				Model:     a.Model,
+				Provider:  a.Provider,
+				Status:    a.Status,
+				AgentType: a.AgentType,
+				IsDefault: a.IsDefault,
+				IsRunning: isRunning,
+			})
+		}
+		client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+			"agents": infos,
+		}))
+		return
+	}
+
+	// Standalone mode: list from in-memory router
 	infos := m.agents.ListInfo()
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
 		"agents": infos,
